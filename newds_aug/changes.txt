@@ -2,7 +2,7 @@ LeafOCR - changes and speed notes
 =================================
 Last updated: 2026-10-06
 Original code: git commit f353e38 (SFR-API repo). The version before the
-UI changes is kept as app.py.bak.
+UI changes is in git history (commit 72fd80e, newds_aug/app.py.bak).
 
 
 1. CHANGES MADE TO SPEED UP OCR, AND WHY

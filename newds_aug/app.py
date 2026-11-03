@@ -1612,10 +1612,6 @@ footer { display:none !important; }
     transition:background .15s !important;
 }
 #export-btn:hover { background:#183e2a !important; }
-/* Download link that Gradio renders after export */
-#export-file { flex:none; }
-#export-file a { font-size:11px !important; color:#346b50 !important; font-weight:600; text-decoration:none; }
-#export-file a:hover { text-decoration:underline; }
 
 /* ── Loading skeleton ── */
 #ocr-loading:not(:has(.ocr-skeleton)) { display:none !important; }
@@ -1858,15 +1854,26 @@ with gr.Blocks(title="Palm Leaf OCR") as demo:
     # ── Export event ───────────────────────────────────────────────────────
     def _do_export_ui(fmt, session):
         path = do_export(fmt, session)
-        if path:
-            return gr.update(value=path, visible=True)
-        return gr.update(value=None, visible=False)
+        return path
 
+    # Build the file on the server, then have the browser download it right away.
     export_btn.click(
         fn=_do_export_ui,
         inputs=[export_fmt, session_state],
         outputs=[export_file],
         concurrency_limit=None,
+    ).success(
+        fn=None,
+        inputs=[export_file],
+        js="""(file) => {
+            if (!file || !file.url) return;
+            const link = document.createElement('a');
+            link.href = file.url;
+            link.download = file.orig_name || '';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        }""",
     )
 
     # ── Scanner toggle ─────────────────────────────────────────────────────

@@ -23,7 +23,20 @@ cd leafocr
 git lfs pull
 ```
 
-The local Python virtual environment, caches, logs, and machine-specific
-Windows shortcut are deliberately excluded. Recreate the Python environment
-before launching `newds_aug/app.py` or `run_palm_leaf_ocr.bat`.
-The existing WSL setup and GPU launch scripts are also included.
+## Install and run
+
+Use Python 3.11. The local virtual environment, caches, logs, and
+machine-specific Windows shortcut are deliberately excluded, so create the
+environment first:
+
+```sh
+cd newds_aug
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt   # Windows: .venv\Scripts\pip
+.venv/bin/python app.py                     # Windows: run_palm_leaf_ocr.bat
+```
+
+The WSL setup and GPU launch scripts are also included.
+
+Fonts in `newds_aug/fonts` are Noto Sans and Noto Sans Malayalam under the SIL
+Open Font License (`fonts/OFL.txt`); Noto Sans is reduced to its Latin characters.

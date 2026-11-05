@@ -25,11 +25,19 @@ Run with:  python app.py
 """
 
 import os
+import io
+import re
 import math
 import json
+import base64
 import hashlib
+import datetime
+import tempfile
+import threading
+import zipfile
 import numpy as np
 import cv2
+from PIL import Image as PILImage
 
 import tensorflow as tf
 from tensorflow.keras import layers
@@ -304,6 +312,10 @@ _deeplab_model = None
 _crnn_model = None
 _num_to_char = None
 
+# Only one model load or prediction at a time. A scan replaced by Reset or a new
+# image finishes its current call in the background, next to the new scan.
+_MODEL_LOCK = threading.Lock()
+
 
 def get_deeplab_model():
     global _deeplab_model
@@ -512,7 +524,8 @@ def predict_patches_batch(model, patches_bgr):
     on CPU because of per-call overhead. Returns list of (patch_rgb, mask)."""
     rgb_list = [cv2.cvtColor(p, cv2.COLOR_BGR2RGB) for p in patches_bgr]
     batch = np.stack([rgb.astype(np.float32) / 255.0 for rgb in rgb_list], axis=0)
-    preds = model.predict(batch, verbose=0)
+    with _MODEL_LOCK:
+        preds = model.predict(batch, verbose=0)
     masks = (preds.squeeze(-1) > 0.5).astype(np.uint8)
     return [(rgb_list[i], masks[i]) for i in range(len(rgb_list))]
 
@@ -848,15 +861,16 @@ def predict_chunks_batch(
     # PREDICT
     # ========================================================
 
-    preds = model.predict(
+    with _MODEL_LOCK:
+        preds = model.predict(
 
-        [
-            batch,
-            dummy_label
-        ],
+            [
+                batch,
+                dummy_label
+            ],
 
-        verbose=0
-    )
+            verbose=0
+        )
 
 
     # ========================================================
@@ -989,7 +1003,8 @@ def render_scan(recon_bgr, rect=None, color=CURRENT_COLOR, max_side=None):
 # Order of the values every pipeline/handler function returns; must match
 # the `outputs=` list wired up in the UI section.
 OUT_KEYS = ("mask", "scan", "lines", "chunks", "transcript", "plain", "status", "region", "session",
-            "stop_btn", "resume_btn", "skeleton")
+            "run_btn", "stop_btn", "resume_btn", "reset_btn", "copy_btn", "export_btn", "export_hint",
+            "skeleton")
 
 # Placeholder shown in the transcript panel (and a sweep over the live scan)
 # while models load and the page is segmented — i.e. until the first chunk of
@@ -1009,14 +1024,33 @@ def _out(**values):
     return tuple(values[k] if k in values else gr.skip() for k in OUT_KEYS)
 
 
-def _buttons(paused):
-    """Stop and Resume share one slot: Stop normally, Resume while paused."""
-    return {"stop_btn": gr.update(visible=not paused), "resume_btn": gr.update(visible=paused)}
+def _controls(state, has_text=False):
+    """Which Action buttons can be pressed in each state of the app.
+
+    state: "empty" (no image), "ready" (image, not started), "running",
+    "paused" or "done". Stop and Resume share one slot: Resume replaces Stop
+    while paused. Export is only forced off here while running; every other
+    state is decided by export_state, which also knows the chosen file type.
+    """
+    running = state == "running"
+    paused = state == "paused"
+    updates = {
+        "run_btn": gr.update(interactive=state != "empty" and not running),
+        "stop_btn": gr.update(visible=not paused, interactive=running),
+        "resume_btn": gr.update(visible=paused, interactive=paused),
+        "reset_btn": gr.update(interactive=state != "empty"),
+        "copy_btn": gr.update(interactive=has_text and not running),
+    }
+    if running:
+        updates["export_btn"] = gr.update(interactive=False)
+        updates["export_hint"] = "Export unlocks when the scan finishes"
+    return updates
 
 
 def new_session():
     return {
         "key": None,          # fingerprint of the image this progress belongs to
+        "name": "",           # file name of the uploaded image, used by the exports
         "orig_rgb": None,
         "patch_masks": {},    # segmentation progress: patch idx -> mask
         "recon": None,        # reconstructed BGR image (set once segmentation is done)
@@ -1027,6 +1061,10 @@ def new_session():
         "next_line": 0,       # index of the first line not fully recognized yet
                               # (its finished chunks are kept; resume skips them)
         "records": [],        # one dict per recognized chunk: line, chunk, text, rect, img
+        "stop": None,         # request to the running scan: "pause" (Stop) or "discard"
+                              # (Reset or a new image). Scans end themselves at their next
+                              # safe point; force-cancelling one made the next scan hang.
+        "paused": False,      # the scan stopped and can be resumed
         "done": False,
     }
 
@@ -1068,14 +1106,14 @@ def _progress_status(session):
     return f"{session['next_line']}/{total} line(s), {len(session['records'])} chunk(s)"
 
 
-def run_pipeline(image, session=None):
+def run_pipeline(image, session=None, name=""):
     """Recognize: start from scratch on the uploaded image."""
-    yield from _guarded(_pipeline(image, session, resume=False))
+    yield from _guarded(_pipeline(image, session, name, resume=False))
 
 
-def resume_pipeline(image, session=None):
+def resume_pipeline(image, session=None, name=""):
     """Resume: continue a stopped run on the same image."""
-    yield from _guarded(_pipeline(image, session, resume=True))
+    yield from _guarded(_pipeline(image, session, name, resume=True))
 
 
 def _guarded(gen):
@@ -1083,11 +1121,11 @@ def _guarded(gen):
     try:
         yield from gen
     except Exception:
-        yield _out(skeleton="", **_buttons(paused=False))
+        yield _out(skeleton="", **_controls("ready"))
         raise
 
 
-def _pipeline(image, session, resume):
+def _pipeline(image, session, name, resume):
     if image is None:
         yield _out(status="Upload an image to begin.")
         return
@@ -1100,30 +1138,42 @@ def _pipeline(image, session, resume):
             yield _out(status="Nothing to resume for this image · press Recognize to start")
             return
         if session["done"]:
-            yield _out(status=f"Already complete · {_progress_status(session)}")
+            yield _out(status=f"Already complete · {_progress_status(session)}",
+                       **_controls("done", has_text=bool(session["records"])))
             return
+        session["paused"] = False
+        session["stop"] = None
         yield _out(status="Resuming…", skeleton="" if session["records"] else SKELETON_HTML,
-                   **_buttons(paused=False))
+                   **_controls("running"))
     else:
         # A NEW dict (not cleared in place): a previously stopped run that is
         # still finishing its last step can't write into this one.
         session = new_session()
         session["key"] = key
+        session["name"] = name or ""
         session["orig_rgb"] = image
         # Clear the previous transcript before expensive model loading/inference.
         yield _out(mask=None, scan=image, lines=[], chunks=[], transcript=[], plain="", region=None,
                    status="Preparing · loading recognition model", session=session,
-                   skeleton=SKELETON_HTML, **_buttons(paused=False))
+                   skeleton=SKELETON_HTML, **_controls("running"))
 
     orig_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    crnn, num_to_char = get_crnn_model()
+    with _MODEL_LOCK:
+        crnn, num_to_char = get_crnn_model()
 
     # 1. Segment (in small batches) + reconstruct — skipped when resuming
     #    after segmentation already finished.
     if session["recon"] is None:
+        if session["stop"]:
+            yield from _end_scan(session)
+            return
         yield _out(status="Scanning · loading segmentation model")
-        deeplab = get_deeplab_model()
+        with _MODEL_LOCK:
+            deeplab = get_deeplab_model()
         for done, total in segment_patches_iter(deeplab, orig_bgr, session["patch_masks"]):
+            if session["stop"]:
+                yield from _end_scan(session)
+                return
             yield _out(status=f"Scanning · finding text · patch {done}/{total}")
 
         recon_bgr, mask = assemble_reconstruction(orig_bgr, session["patch_masks"])
@@ -1147,7 +1197,8 @@ def _pipeline(image, session, resume):
     if not session["line_crops"]:
         session["done"] = True
         yield _out(mask=session["overlay"], scan=render_scan(recon_bgr), lines=[], skeleton="",
-                   status="No text lines detected. Try a clearer image with complete text lines.")
+                   status="No text lines detected. Try a clearer image with complete text lines.",
+                   **_controls("done"))
         return
 
     records = session["records"]
@@ -1168,6 +1219,9 @@ def _pipeline(image, session, resume):
     #    screen one at a time (live). Only the scan image + transcript are
     #    sent per chunk; the galleries are sent once at the end.
     for li in range(session["next_line"], total_lines):
+        if session["stop"]:
+            yield from _end_scan(session)
+            return
         line_img = session["line_crops"][li]
         top_p, bot_p, left = session["line_offsets"][li]
         bounds, imgs = split_line_into_chunks_with_bounds(line_img)
@@ -1177,6 +1231,9 @@ def _pipeline(image, session, resume):
         texts = predict_chunks_batch(crnn, num_to_char, [img for _k, _b, img in todo]) if todo else []
 
         for (chunk_idx, (cl, cr), chunk_img), text in zip(todo, texts):
+            if session["stop"]:
+                yield from _end_scan(session)
+                return
             if chunk_img.size == 0:
                 continue
             rect = (left + cl, top_p, left + cr, bot_p)
@@ -1203,35 +1260,57 @@ def _pipeline(image, session, resume):
         skeleton="",
         status=f"Complete · recognized {len(records)} chunk(s) across {n_lines} line(s) · "
                f"click any text to see where it came from",
+        **_controls("done", has_text=bool(records)),
     )
 
 
-def stop_pipeline(session):
-    """Runs after the Stop button cancels the running generator."""
-    if session is None or session["key"] is None:
-        return _out(status="Stopped", skeleton="")
-    if session["done"]:  # nothing was running; keep the finished result as is
-        return _out()
+def _end_scan(session):
+    """The scan's last step after a request to stop."""
+    if session["stop"] == "discard":
+        # The screen now belongs to whatever replaced this scan. Gradio repeats a
+        # scan's last update when it ends, so that update must change nothing.
+        yield _out()
+        return
+    session["paused"] = True
     if session["recon"] is None:
         done = len(session["patch_masks"])
-        return _out(status=f"Paused while finding text ({done} patch(es) done) · press Resume to continue",
-                    skeleton="", **_buttons(paused=True))
+        yield _out(status=f"Paused while finding text ({done} patch(es) done) · press Resume to continue",
+                   skeleton="", **_controls("paused"))
+        return
     records = session["records"]
-    return _out(
+    yield _out(
         scan=render_scan(session["recon"], _last_rect(records), CURRENT_COLOR),
         chunks=chunk_gallery(records),
         transcript=build_transcript(records, current=len(records) - 1 if records else None),
         plain=plain_text(records),
         status=f"Paused · {_progress_status(session)} done · press Resume to continue",
         skeleton="",
-        **_buttons(paused=True),
+        **_controls("paused", has_text=bool(records)),
     )
 
 
-def reset_session(_session=None):
+def stop_pipeline(session):
+    """Stop: ask the running scan to pause at its next safe point, which ends it cleanly."""
+    if session is None or session["key"] is None or session["done"]:
+        return _out()
+    session["stop"] = "pause"
+    return _out(status="Stopping · finishing the current step", stop_btn=gr.update(interactive=False))
+
+
+def on_image_change(image, session=None):
+    """A new image starts clean; removing the image returns to the empty state."""
+    if session is not None:
+        session["stop"] = "discard"  # any scan of the previous image ends itself
+    has_image = image is not None
+    status = "Ready · press Recognize manuscript" if has_image else "Upload an image to begin"
     return _out(mask=None, scan=None, lines=[], chunks=[], transcript=[], plain="", region=None,
-                status="Ready · upload an image to begin", session=new_session(),
-                skeleton="", **_buttons(paused=False))
+                status=status, session=new_session(), skeleton="",
+                **_controls("ready" if has_image else "empty"))
+
+
+def reset_session(session):
+    """Reset: clear the image and every result. The extra value empties the upload box."""
+    return (*on_image_change(None, session), None)
 
 
 def _show_source(session, idx):
@@ -1267,36 +1346,60 @@ def select_from_gallery(session, evt: gr.SelectData):
     return _show_source(session, evt.index)
 
 
-
 # ============================================================
-# 10. GRADIO UI
+# 10. EXPORTS — each format starts with the title, then the
+#    source image and its file name, and downloads under the same
+#    name as the uploaded image. Plain text cannot hold an image,
+#    so Text downloads as a zip of the .txt and the image.
 # ============================================================
-import base64
-import io
-import tempfile
-import datetime
 
-# ── Export helpers ───────────────────────────────────────────────────────────
+def _export_path(session, ext):
+    """Path named after the uploaded image, in its own folder so names never clash."""
+    stem = os.path.splitext(session.get("name") or "")[0]
+    stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", stem).strip(" .") or "manuscript"
+    return os.path.join(tempfile.mkdtemp(prefix="leafocr_"), f"{stem}.{ext}")
 
-def _timestamp():
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def _export_date():
+    return datetime.datetime.now().strftime("%d %B %Y, %H:%M")
+
+
+def _source_jpeg(session):
+    """The original image as an in-memory JPEG, plus its width and height in pixels."""
+    picture = PILImage.fromarray(session["orig_rgb"])
+    data = io.BytesIO()
+    picture.save(data, format="JPEG", quality=92)
+    data.seek(0)
+    return data, picture.width, picture.height
+
+
+def _fit(width, height, max_width, max_height):
+    """Largest size that fits inside the limits and keeps the image's shape."""
+    scale = min(max_width / width, max_height / height)
+    return width * scale, height * scale
 
 
 def export_txt(session):
-    """Export plain text transcript."""
-    if not session or not session.get("records"):
-        return None
-    text = plain_text(session["records"])
-    path = os.path.join(tempfile.gettempdir(), f"leafocr_{_timestamp()}.txt")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    """Export a zip: a .txt (title, source image name, transcript) and the image as a lossless PNG."""
+    text = (
+        "LeafOCR Transcript\n\n"
+        f"Source image: {session.get('name') or 'not named'}\n"
+        f"Exported: {_export_date()}\n\n"
+        f"{plain_text(session['records'])}"
+    )
+    picture = io.BytesIO()
+    PILImage.fromarray(session["orig_rgb"]).save(picture, format="PNG")
+
+    path = _export_path(session, "zip")
+    stem = os.path.splitext(os.path.basename(path))[0]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{stem}.txt", text.encode("utf-8"))
+        archive.writestr(f"{stem}.png", picture.getvalue())
     return path
 
 
 def export_docx(session):
-    """Export a Word document with one paragraph per line."""
-    if not session or not session.get("records"):
-        return None
+    """Export a Word document: title, source image, name and date, then one paragraph per line."""
     from docx import Document
     from docx.shared import Pt, RGBColor, Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1315,22 +1418,21 @@ def export_docx(session):
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title.runs[0].font.color.rgb = RGBColor(0x25, 0x3e, 0x34)
 
-    ts = doc.add_paragraph(
-        f"Exported: {datetime.datetime.now().strftime('%d %B %Y, %H:%M')}"
-    )
+    picture, px_w, px_h = _source_jpeg(session)
+    width, _height = _fit(px_w, px_h, 15.5, 11)
+    doc.add_picture(picture, width=Cm(width))
+    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    source = f"Source image: {session['name']}  ·  " if session.get("name") else ""
+    ts = doc.add_paragraph(f"{source}Exported: {_export_date()}")
     ts.alignment = WD_ALIGN_PARAGRAPH.CENTER
     ts.runs[0].font.size = Pt(9)
     ts.runs[0].font.color.rgb = RGBColor(0x7b, 0x86, 0x7b)
     doc.add_paragraph()   # spacer
 
-    records = session["records"]
-    lines_map = {}
-    for r in records:
-        lines_map.setdefault(r["line"], []).append(r["text"])
-
-    for li in sorted(lines_map):
+    for line_text in plain_text(session["records"]).split("\n"):
         para = doc.add_paragraph()
-        run = para.add_run(" ".join(lines_map[li]))
+        run = para.add_run(line_text)
         run.font.size = Pt(14)
         # Malayalam is a complex script: Word reads its font and size from the
         # separate w:cs / w:szCs properties, not the ones set above.
@@ -1342,15 +1444,16 @@ def export_docx(session):
         rpr.append(size_cs)
         para.paragraph_format.space_after = Pt(8)
 
-    path = os.path.join(tempfile.gettempdir(), f"leafocr_{_timestamp()}.docx")
+    path = _export_path(session, "docx")
     doc.save(path)
     return path
 
 
 def export_pdf(session):
-    """Export a PDF using fpdf2 with the bundled Noto fonts, so it works on any computer."""
-    if not session or not session.get("records"):
-        return None
+    """Export a PDF: title, source image, name and date, then the transcript.
+
+    Uses fpdf2 with the bundled Noto fonts, so it works on any computer.
+    """
     from fpdf import FPDF
 
     class PDF(FPDF):
@@ -1363,8 +1466,8 @@ def export_pdf(session):
 
     pdf = PDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.add_page()
     pdf.set_margins(25, 20, 20)
+    pdf.add_page()
 
     pdf.add_font("NotoSans", style="", fname=os.path.join(FONT_DIR, "NotoSans-Regular.ttf"))
     pdf.add_font("NotoSans", style="B", fname=os.path.join(FONT_DIR, "NotoSans-Bold.ttf"))
@@ -1378,14 +1481,21 @@ def export_pdf(session):
     pdf.set_font("NotoSans", style="B", size=18)
     pdf.set_text_color(37, 62, 52)
     pdf.cell(0, 10, "LeafOCR Transcript", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(2)
+    pdf.ln(4)
 
-    # Timestamp
-    pdf.set_font("NotoSans", size=9)
+    # Source image
+    picture, px_w, px_h = _source_jpeg(session)
+    width, height = _fit(px_w, px_h, 165, 110)
+    pdf.image(picture, x=(pdf.w - width) / 2, y=pdf.get_y(), w=width, h=height)
+    pdf.set_y(pdf.get_y() + height + 6)
+
+    # Source name and date. The name can be Malayalam, so this uses the Malayalam
+    # font, which takes any English letters from the fallback.
+    pdf.set_font("NotoMalayalam", size=9)
     pdf.set_text_color(123, 134, 123)
-    pdf.cell(0, 6,
-             f"Exported: {datetime.datetime.now().strftime('%d %B %Y, %H:%M')}",
-             align="C", new_x="LMARGIN", new_y="NEXT")
+    if session.get("name"):
+        pdf.cell(0, 6, f"Source image: {session['name']}", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Exported: {_export_date()}", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
 
     # Divider
@@ -1397,13 +1507,7 @@ def export_pdf(session):
     pdf.set_font("NotoMalayalam", size=14)
     pdf.set_text_color(52, 69, 54)
 
-    records = session["records"]
-    lines_map = {}
-    for r in records:
-        lines_map.setdefault(r["line"], []).append(r["text"])
-
-    for li in sorted(lines_map):
-        line_text = " ".join(lines_map[li])
+    for line_text in plain_text(session["records"]).split("\n"):
         pdf.multi_cell(0, 9, line_text, new_x="LMARGIN", new_y="NEXT")
         pdf.ln(3)
 
@@ -1415,21 +1519,27 @@ def export_pdf(session):
             if glyph is not None and glyph.unicode == ():
                 glyph.unicode = (0x200B,)
 
-    path = os.path.join(tempfile.gettempdir(), f"leafocr_{_timestamp()}.pdf")
+    path = _export_path(session, "pdf")
     pdf.output(path)
     return path
 
 
-# Dispatcher — called by the export button
-_EXPORT_FNS = {
-    "Plain text (.txt)":   export_txt,
-    "Word document (.docx)": export_docx,
-    "PDF (.pdf)":          export_pdf,
-}
+# The file types offered in the Action block: (label on screen, value, export function)
+EXPORT_TYPES = (
+    ("Text", "txt", export_txt),
+    ("Word", "docx", export_docx),
+    ("PDF", "pdf", export_pdf),
+)
+_EXPORT_FNS = {value: fn for _label, value, fn in EXPORT_TYPES}
+
 
 def do_export(fmt, session):
+    """Called by the Export button. Returns the file's path, or None with a warning."""
     fn = _EXPORT_FNS.get(fmt)
-    if fn is None or not session or not session.get("records"):
+    if fn is None:
+        gr.Warning("Choose a file type to export.")
+        return None
+    if not session or not session.get("records"):
         gr.Warning("Nothing to export yet. Recognize a manuscript first.")
         return None
     try:
@@ -1442,6 +1552,25 @@ def do_export(fmt, session):
         gr.Warning(f"{fmt} export failed: {e}")
     return None
 
+
+def export_state(fmt, session):
+    """Export needs a chosen file type and a finished or paused scan with text.
+
+    Returns the button's state and the message that tells the user what is missing.
+    """
+    ready = bool(session and session["records"] and (session["done"] or session["paused"]))
+    if not fmt:
+        hint = "Choose a file type to export"
+    elif not ready:
+        hint = "Recognize a manuscript to export it"
+    else:
+        hint = ""
+    return gr.update(interactive=bool(fmt and ready)), hint
+
+
+# ============================================================
+# 11. GRADIO UI
+# ============================================================
 
 # ── CSS ──────────────────────────────────────────────────────────────────────
 
@@ -1463,50 +1592,107 @@ body, .dark, gradio-app { background: #f3f2ec !important; }
     --button-secondary-background-fill: #eff3ed; --button-secondary-text-color: #253e34;
 }
 .gradio-container [data-testid="block-info"] { background:transparent !important; color:#65765f !important; font-size:11px !important; font-weight:600 !important; box-shadow:none !important; }
-.brandbar { display:flex; align-items:center; justify-content:space-between; padding:0 0 20px; border-bottom:1px solid #d9dfd4; }
+.brandbar { display:flex; align-items:center; justify-content:space-between; padding:0 0 10px; border-bottom:1px solid #d9dfd4; }
 .brand { display:flex; align-items:center; gap:10px; font-weight:700; font-size:23px; letter-spacing:-1px; }
 .brand-mark { display:grid; place-items:center; width:38px; height:38px; background:#214d38; color:#e7efd9; border-radius:12px 12px 12px 3px; }
 .brand-mark svg { fill:#e7efd9 !important; }
 .brand-note { color:#728071; font-size:11px; text-transform:uppercase; letter-spacing:2px; }
 .brand-right { display:flex; align-items:center; gap:20px; }
-.leaf-seal { width:76px; height:76px; flex:none; border:1px solid #d1dac9; border-radius:50%; display:grid; place-content:center; text-align:center; color:#708368; font:30px 'Noto Sans Malayalam',sans-serif; background:radial-gradient(circle,#e8edde,#f3f2ec); }
+.leaf-seal { width:60px; height:60px; flex:none; border:1px solid #d1dac9; border-radius:50%; display:grid; place-content:center; text-align:center; color:#708368; font:25px 'Noto Sans Malayalam',sans-serif; background:radial-gradient(circle,#e8edde,#f3f2ec); }
 .leaf-seal small { font:7px 'Noto Sans',sans-serif; letter-spacing:1.1px; margin-top:4px; }
 
-/* ── Scanner toggle toolbar ── */
+/* ── Live scanner toggle: Hide sits in the scanner card, Show in the toolbar while hidden ── */
 #scanner-toolbar { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-bottom:10px; }
 #scanner-toolbar > div { flex:none !important; width:auto !important; }
-#toggle-scanner {
+.scanner-toggle {
     display:inline-flex !important; align-items:center !important; gap:6px !important;
     background:#eff3ed !important; border:1px solid #cfd8c7 !important; border-radius:9px !important;
     padding:6px 14px !important; font-size:12px !important; font-weight:600 !important;
     color:#3d5c44 !important; cursor:pointer !important;
     transition:background .15s, box-shadow .15s !important;
     white-space:nowrap !important; min-height:0 !important; height:34px !important;
-    width:auto !important;
+    width:auto !important; flex:none !important;
 }
-#toggle-scanner:hover { background:#e3ead9 !important; box-shadow:0 2px 6px #2a4a3510 !important; }
+.scanner-toggle:hover { background:#e3ead9 !important; box-shadow:0 2px 6px #2a4a3510 !important; }
+.card-head { flex-wrap:nowrap !important; align-items:center !important; justify-content:space-between !important; gap:10px !important; }
+.card-head > .stage-title { flex:1 1 auto !important; min-width:0 !important; }
+
+/* ── Action block ── */
+#action-card { padding:12px 20px !important; gap:6px !important; margin:14px 0 !important; }
+#action-row { flex-wrap:wrap !important; align-items:center !important; gap:10px !important; }
+#action-row > * { flex:none !important; width:auto !important; min-width:0 !important; }
+#action-title { margin-right:6px; }
+#action-row button { height:42px !important; min-height:42px !important; border-radius:999px !important; padding:0 18px !important; font-size:13px !important; font-weight:600 !important; white-space:nowrap; }
+#action-row button:disabled { opacity:.42; cursor:not-allowed !important; box-shadow:none !important; transform:none !important; }
+#action-foot { flex-wrap:nowrap !important; align-items:center !important; justify-content:space-between !important; gap:16px !important; min-height:18px; }
+#action-foot > * { min-width:0 !important; }
+/* Gradio draws a progress bar over anything a running scan updates; these two are just text. */
+#action-foot .wrap.center.full { display:none !important; }
+#action-foot .pending { opacity:1 !important; }
+/* Copy text says what happened for a moment; the message comes from data-msg. */
+#copy-text.copy-note { font-size:0 !important; transition:none !important; }
+#copy-text.copy-note::before { font-size:13px !important; }
+#copy-text.copy-note::after { content:attr(data-msg); font-size:13px; }
+#copy-text.copied { background:#28563e !important; border-color:#28563e !important; color:#fffef8 !important; }
+#export-hint { flex:none !important; width:auto !important; padding:0 !important; background:transparent !important; border:0 !important; }
+#export-hint p { color:#a8651b !important; font-size:11px !important; font-weight:600 !important; margin:0 !important; white-space:nowrap; }
+
+/* ── File type tiles: small sheets of paper, picked instead of a dropdown ── */
+#export-type { margin-left:auto; background:transparent !important; border:0 !important; padding:0 !important; }
+#export-type .wrap { display:flex !important; flex-wrap:nowrap !important; gap:8px !important; }
+#export-type label {
+    position:relative; display:inline-flex !important; align-items:center; gap:7px; height:42px; margin:0 !important;
+    padding:0 14px 0 10px !important; border:1px solid #cfd8c7 !important; border-radius:11px !important;
+    background:#f7f8f3 !important; color:#3d5c44 !important; cursor:pointer; box-shadow:none !important;
+    font-size:12px; font-weight:600; transition:transform .15s, box-shadow .15s, background .15s;
+}
+#export-type label span { color:inherit !important; margin:0 !important; }
+#export-type input { position:absolute !important; opacity:0 !important; width:0 !important; height:0 !important; margin:0 !important; }
+#export-type label::before {
+    content:""; width:20px; height:24px; flex:none; background:var(--sheet,#57734d);
+    -webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 24'%3E%3Cpath fill-rule='evenodd' d='M3 0h9l8 8v13a3 3 0 0 1-3 3H3a3 3 0 0 1-3-3V3a3 3 0 0 1 3-3zm9 1.5V8h6.5zM4 12h12v1.6H4zm0 4h12v1.6H4zm0 4h8v1.6H4z'/%3E%3C/svg%3E") center/contain no-repeat;
+    mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 24'%3E%3Cpath fill-rule='evenodd' d='M3 0h9l8 8v13a3 3 0 0 1-3 3H3a3 3 0 0 1-3-3V3a3 3 0 0 1 3-3zm9 1.5V8h6.5zM4 12h12v1.6H4zm0 4h12v1.6H4zm0 4h8v1.6H4z'/%3E%3C/svg%3E") center/contain no-repeat;
+    transition:transform .15s;
+}
+#export-type label:nth-of-type(2) { --sheet:#2b5c9e; }
+#export-type label:nth-of-type(3) { --sheet:#b8402f; }
+#export-type label:hover { transform:translateY(-2px); box-shadow:0 4px 10px #233e2f1f !important; }
+#export-type label:hover::before { transform:rotate(-6deg); }
+#export-type label:has(input:checked) { --sheet:#fffef8; background:#28563e !important; border-color:#28563e !important; color:#fffef8 !important; box-shadow:0 4px 10px #28563e40 !important; }
+#export-type label:has(input:focus-visible) { outline:2px solid #346b50; outline-offset:2px; }
 
 /* ── Stage cards ── */
 .stage-card {
     background:#fffefa !important; border:1px solid #dce2d8 !important;
-    border-radius:18px !important; padding:20px !important;
-    box-shadow:0 5px 20px #233e2f06; gap:14px !important;
+    border-radius:18px !important; padding:14px !important;
+    box-shadow:0 5px 20px #233e2f06; gap:10px !important;
 }
-.stage-title { height:78px; flex:none !important; }
-.stage-heading { display:flex; align-items:center; gap:10px; margin-bottom:9px; }
+.stage-title { min-height:36px; flex:none !important; display:flex; align-items:center; }
+.stage-title, .stage-title * { overflow:visible !important; }
+.stage-heading { display:flex; align-items:center; gap:10px; }
 .step { display:grid; place-items:center; width:28px; height:28px; border-radius:9px; background:#edf2e7; color:#57734d; font-size:11px; font-weight:700; }
 .stage-heading h2 { font-size:17px; font-weight:650; color:#253e34; margin:0; letter-spacing:-.3px; }
-.stage-title p { color:#7b867b; font-size:12px; line-height:1.65; margin:0; }
-.status-bar { background:#e9efe2; border:1px solid #d7e1ce; border-radius:10px; padding:9px 14px !important; margin-bottom:6px; }
-.status-bar p { font-size:12px !important; color:#50674a !important; margin:0 !important; }
-.status-bar p:before { content:'●'; color:#598152; margin-right:9px; font-size:10px; }
+
+/* ── Question mark beside a title: shows its text on hover, or on tap and keyboard focus ── */
+.tip { position:relative; display:grid; place-items:center; width:18px; height:18px; flex:none; border:1px solid #cfd8c7; border-radius:50%; background:#f7f8f3; color:#57734d; font-size:11px; font-weight:700; cursor:help; outline-offset:2px; }
+.tip::after {
+    content:attr(data-tip); position:absolute; top:calc(100% + 8px); left:-10px; z-index:50; width:max-content; max-width:230px;
+    padding:8px 11px; border-radius:9px; background:#253e34; color:#fffef8; font-size:12px; font-weight:400; line-height:1.5; letter-spacing:0;
+    box-shadow:0 6px 18px #233e2f33; opacity:0; visibility:hidden; transform:translateY(-3px); transition:opacity .15s, transform .15s; pointer-events:none;
+}
+.tip:hover::after, .tip:focus::after { opacity:1; visibility:visible; transform:translateY(0); }
+
+/* ── Status line: one small line inside the Action block ── */
+.status-bar { flex:1 1 auto !important; min-width:0 !important; padding:0 !important; background:transparent !important; border:0 !important; }
+.status-bar p { font-size:11px !important; color:#50674a !important; margin:0 !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.status-bar p:before { content:'●'; color:#598152; margin-right:7px; font-size:8px; }
 
 /* ── Workspace row ── */
 #workspace { gap:20px; align-items:stretch !important; }
 
 /* ── Rectangular image panel ── */
 .image-stage {
-    height:360px !important; min-height:320px !important; flex:none !important;
+    height:260px !important; min-height:230px !important; flex:none !important;
     border:1px solid #cfd8c7 !important; border-radius:12px !important;
     background:#f3f5ee !important; overflow:hidden !important;
     display:flex !important; align-items:center !important; justify-content:center !important;
@@ -1517,7 +1703,7 @@ body, .dark, gradio-app { background: #f3f2ec !important; }
 
 /* ── Rectangular transcript panel ── */
 #transcript {
-    height:300px !important; overflow-y:auto !important; flex:none !important;
+    height:215px !important; overflow-y:auto !important; flex:none !important;
     background:#faf8f0 !important; border:1px solid #e8e3d4 !important;
     border-radius:12px !important; box-sizing:border-box !important;
 }
@@ -1533,43 +1719,20 @@ body, .dark, gradio-app { background: #f3f2ec !important; }
 /* ── Source region panel ── */
 #region { height:110px !important; flex:none !important; border-radius:12px !important; }
 
-/* ── Controls ── */
-#run-controls { gap:8px; }
-#copy-text { align-self:flex-end; flex:none !important; min-height:0 !important; height:30px; width:auto !important; padding:0 12px !important; border-radius:9px !important; font-size:12px !important; }
-#run-controls button { border-radius:9px !important; font-size:12px !important; }
-#recognize { background:#28563e !important; color:#fffef8 !important; border:1px solid #28563e !important; border-radius:999px !important; font-size:14px !important; font-weight:600 !important; flex:none !important; align-self:center; width:auto !important; height:42px !important; min-height:42px; max-height:42px; padding:0 28px !important; box-shadow:0 3px 8px #28563e20; transition:background .15s,transform .15s; }
-#recognize:hover { background:#183e2a !important; transform:translateY(-1px); }
+/* ── Main buttons: Recognize and Export are the filled ones ── */
+#recognize, #export-btn { background:#28563e !important; color:#fffef8 !important; border:1px solid #28563e !important; box-shadow:0 3px 8px #28563e20; transition:background .15s,transform .15s; }
+#recognize { padding:0 24px !important; font-size:14px !important; }
+#recognize:not(:disabled):hover, #export-btn:not(:disabled):hover { background:#183e2a !important; transform:translateY(-1px); }
 .panel-note { color:#81907e; font-size:11px; line-height:1.7; padding-top:3px; }
 #details { margin-top:10px; background:#fffefa !important; border:1px solid #dce2d8 !important; border-radius:12px !important; }
 #details button, #details button span { color:#53654d !important; }
 .app-foot { display:flex; justify-content:space-between; gap:16px; color:#8a9485; font-size:10px; letter-spacing:.7px; padding:14px 2px 4px; }
 footer { display:none !important; }
 
-/* ── Export bar ── */
-#export-bar {
-    display:flex; align-items:center; gap:8px;
-    background:#f3f5ee; border:1px solid #dce2d8; border-radius:11px;
-    padding:8px 12px; margin-top:4px;
-}
-#export-bar > * { margin:0 !important; }
-#export-bar label { display:none !important; }        /* hide Gradio label */
-#export-fmt { flex:1 1 auto; min-width:0 !important; }
-#export-fmt select { font-size:12px !important; height:32px !important; border-radius:8px !important; padding:0 8px !important; }
-#export-btn {
-    flex:none !important; min-width:0 !important; width:auto !important;
-    height:32px !important; min-height:0 !important;
-    padding:0 14px !important; font-size:12px !important;
-    border-radius:8px !important; font-weight:600 !important;
-    background:#28563e !important; color:#fffef8 !important;
-    border:1px solid #28563e !important;
-    transition:background .15s !important;
-}
-#export-btn:hover { background:#183e2a !important; }
-
 /* ── Loading skeleton ── */
 #ocr-loading:not(:has(.ocr-skeleton)) { display:none !important; }
 #workspace:has(.ocr-skeleton) #transcript { display:none !important; }
-.ocr-skeleton { height:300px; box-sizing:border-box; padding:22px 18px; display:flex; flex-direction:column; gap:18px; background:#faf8f0; border:1px solid #e8e3d4; border-radius:12px; overflow:hidden; animation:sk-enter .3s ease-out both; }
+.ocr-skeleton { height:215px; box-sizing:border-box; padding:22px 18px; display:flex; flex-direction:column; gap:18px; background:#faf8f0; border:1px solid #e8e3d4; border-radius:12px; overflow:hidden; animation:sk-enter .3s ease-out both; }
 .sk-lines { display:flex; flex-direction:column; gap:11px; }
 .sk-line { position:relative; display:block; height:10px; flex:none; border-radius:5px; background:#e8e6d9; overflow:hidden; }
 .sk-line::after { content:''; position:absolute; inset:0; background:linear-gradient(100deg,transparent 15%,#fffdf4b3 48%,transparent 80%); transform:translateX(-110%); animation:sk-shimmer 2.8s cubic-bezier(.4,0,.2,1) infinite; animation-delay:var(--sk-delay,0s); }
@@ -1591,7 +1754,7 @@ footer { display:none !important; }
 }
 
 /* ── Responsive ── */
-.gradio-container.gradio-container { width:100% !important; min-width:0 !important; box-sizing:border-box; padding:clamp(12px,3vw,32px) !important; }
+.gradio-container.gradio-container { width:100% !important; min-width:0 !important; box-sizing:border-box; padding:12px clamp(12px,3vw,32px) clamp(12px,3vw,32px) !important; }
 .gradio-container .main { width:100% !important; min-width:0 !important; padding:0 !important; box-sizing:border-box; }
 
 /* Every screen shows the same design and the same 01, 02, 03 order.
@@ -1599,22 +1762,24 @@ footer { display:none !important; }
 @media(max-width:960px) {
     #workspace { flex-direction:column !important; gap:14px; }
     #workspace .stage-card { min-width:0 !important; width:100% !important; box-sizing:border-box; }
-    #workspace .stage-title { height:auto; min-height:64px; }
     #workspace .image-stage { height:300px !important; min-height:260px !important; }
     #transcript { height:250px !important; }
-    #export-bar { flex-wrap:wrap; }
+    #export-type { margin-left:0; }
 }
 
 @media(max-width:600px) {
-    #workspace .stage-card { padding:16px !important; }
     #workspace .image-stage { height:260px !important; min-height:220px !important; }
     #transcript { height:220px !important; }
     .brandbar { gap:12px; }
     .brandbar .brand-right { gap:10px; }
     .brandbar .brand-note { font-size:8px; letter-spacing:1px; line-height:1.4; max-width:90px; text-align:right; }
-    .brandbar .leaf-seal { width:60px; height:60px; font-size:25px; }
     .app-foot { flex-wrap:wrap; gap:6px; }
-    #export-fmt { min-width:100% !important; }
+    #action-title { width:100% !important; }
+    #action-foot { flex-direction:column !important; align-items:flex-start !important; gap:4px !important; }
+    #export-hint p { white-space:normal; }
+    .status-bar { width:100% !important; }
+    .status-bar p { white-space:normal; }
+    #action-row button { padding:0 14px !important; }
 }
 """
 
@@ -1647,6 +1812,7 @@ def _icon_css():
         ("#reset-btn::before", "M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"),
         ("#copy-text::before", "M8 3h11a2 2 0 0 1 2 2v11h-2V5H8zM5 7h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5"
                                "a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm0 2v10h10V9z"),
+        ("#copy-text.copied::before", "M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"),
         ("#export-btn::before", "M11 4h2v9.2l3.6-3.6L18 11l-6 6-6-6 1.4-1.4L11 13.2zM5 19h14v2H5z"),
     ):
         svg = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E"
@@ -1684,16 +1850,27 @@ window.addEventListener('error', function (e) {
 </script>"""
 
 
-def _toggle_scanner(is_visible):
-    """Toggle the Live Scanner column visibility."""
-    new_visible = not is_visible
-    label = "Hide Live Scanner" if new_visible else "Show Live Scanner"
-    return new_visible, gr.update(visible=new_visible), gr.update(value=label)
+def _card_heading(title, tip, step=None):
+    """Card title with a question mark beside it that shows `tip` on hover or tap."""
+    number = f'<span class="step">{step}</span>' if step else ""
+    return (f'<div class="stage-heading">{number}<h2>{title}</h2>'
+            f'<span class="tip" tabindex="0" role="note" aria-label="{tip}" data-tip="{tip}">?</span></div>')
+
+
+def _hide_scanner():
+    """Scanner closed: its card goes away and the Show button appears in the toolbar."""
+    return gr.update(visible=False), gr.update(visible=True)
+
+
+def _show_scanner():
+    """Scanner open: the toolbar goes away, since Hide lives inside the card."""
+    return gr.update(visible=True), gr.update(visible=False)
 
 
 with gr.Blocks(title="Palm Leaf OCR") as demo:
-    session_state   = gr.State(new_session())
-    scanner_visible = gr.State(True)   # scanner starts open
+    session_state = gr.State(new_session())
+    # File name of the uploaded image; the image input itself only passes on pixels.
+    source_name = gr.Textbox(visible=False)
 
     gr.HTML(
         '<div class="brandbar"><div class="brand"><span class="brand-mark">'
@@ -1701,20 +1878,13 @@ with gr.Blocks(title="Palm Leaf OCR") as demo:
         '<path d="M20 4C10 4 4 9 4 17c0 1 .1 2 .3 3 .6-4 3.6-8.6 9.7-11-4.6 3-7.4 7-8 11.6C16 21 21 14 20 4z"/>'
         '</svg></span>LeafOCR</div>'
         '<div class="brand-right"><div class="brand-note">Palm-leaf manuscript studio</div>'
-        '<div class="leaf-seal" aria-label="Leaf to letter emblem">\u0d05<small>LEAF TO LETTER</small></div></div></div>'
+        '<div class="leaf-seal" aria-label="Leaf to letter emblem">അ<small>LEAF TO LETTER</small></div></div></div>'
     )
 
-    status_output = gr.Markdown("Ready \u00b7 upload an image to begin", elem_classes="status-bar")
-
-    # ── Scanner toggle toolbar ──────────────────────────────────────────────
-    with gr.Row(elem_id="scanner-toolbar"):
-        toggle_btn = gr.Button(
-            "Hide Live Scanner",
-            size="sm",
-            variant="secondary",
-            elem_id="toggle-scanner",
-            scale=0,
-        )
+    # ── Shown only while the scanner is hidden; Hide lives inside the scanner card ──
+    with gr.Row(elem_id="scanner-toolbar", visible=False) as scanner_toolbar:
+        show_scanner_btn = gr.Button("Show Live Scanner", size="sm", variant="secondary", scale=0,
+                                     elem_classes="scanner-toggle", elem_id="show-scanner")
 
     # ── Three-column workspace ─────────────────────────────────────────────
     with gr.Row(equal_height=True, elem_id="workspace"):
@@ -1722,39 +1892,29 @@ with gr.Blocks(title="Palm Leaf OCR") as demo:
         # Column 1 — Your manuscript
         with gr.Column(scale=2, min_width=280, elem_classes="stage-card", elem_id="ms-upload"):
             gr.HTML(
-                '<div class="stage-heading"><span class="step">01</span>'
-                '<h2>Your manuscript</h2></div>'
-                '<p>Start with a leaf image or a cropped text segment.</p>',
+                _card_heading("Your manuscript", "Start with a leaf image or a cropped text segment.", step="01"),
                 elem_classes="stage-title",
             )
             input_image = gr.Image(
-                label="Source image", type="numpy", height=360,
+                label="Source image", type="numpy", height=260,
                 scale=0, elem_classes="image-stage",
                 buttons=["fullscreen"], sources=["upload", "clipboard"],
             )
-            run_btn = gr.Button(
-                "Recognize manuscript",
-                variant="primary", size="md", scale=0, elem_id="recognize",
-            )
-            with gr.Row(elem_id="run-controls"):
-                stop_btn   = gr.Button("Stop",   size="sm", min_width=60, elem_id="stop-btn")
-                resume_btn = gr.Button("Resume", size="sm", min_width=60, visible=False, elem_id="resume-btn")
-                reset_btn  = gr.Button("Reset",  size="sm", min_width=60, elem_id="reset-btn")
 
-        # Column 2 — Live scanner (starts open)
+        # Column 2 — Live scanner
         with gr.Column(
             scale=2, min_width=260,
             elem_classes="stage-card", elem_id="scanner-col",
-            visible=True,
         ) as scanner_col:
-            gr.HTML(
-                '<div class="stage-heading"><span class="step">02</span>'
-                '<h2>Live scanner</h2></div>'
-                '<p>Follow each text region as it is recognized.</p>',
-                elem_classes="stage-title",
-            )
+            with gr.Row(elem_classes="card-head"):
+                gr.HTML(
+                    _card_heading("Live scanner", "Follow each text region as it is recognized.", step="02"),
+                    elem_classes="stage-title",
+                )
+                hide_scanner_btn = gr.Button("Hide", size="sm", variant="secondary", scale=0,
+                                             elem_classes="scanner-toggle", elem_id="hide-scanner")
             annotated_output = gr.Image(
-                label="Live scan", height=360, interactive=False,
+                label="Live scan", height=260, interactive=False,
                 scale=0, elem_classes=["image-stage", "live-scan"],
                 buttons=["fullscreen", "download"],
             )
@@ -1765,13 +1925,15 @@ with gr.Blocks(title="Palm Leaf OCR") as demo:
                 'Open full screen to inspect the finer details.</div>'
             )
 
-        # Column 3 — The transcript
-        with gr.Column(scale=2, min_width=280, elem_classes="stage-card"):
+        # Column 3 — The transcript: source region first, then the recognized text
+        with gr.Column(scale=2, min_width=280, elem_classes="stage-card", elem_id="transcript-col"):
             gr.HTML(
-                '<div class="stage-heading"><span class="step">03</span>'
-                '<h2>The transcript</h2></div>'
-                '<p>Click any word to see where it came from.</p>',
+                _card_heading("The transcript", "Click any word to see where it came from.", step="03"),
                 elem_classes="stage-title",
+            )
+            region_output = gr.Image(
+                label="Source region", height=110, interactive=False,
+                elem_id="region", buttons=["fullscreen"],
             )
             skeleton_output = gr.HTML("", elem_id="ocr-loading")
             output_text = gr.HighlightedText(
@@ -1783,43 +1945,33 @@ with gr.Blocks(title="Palm Leaf OCR") as demo:
                 elem_id="transcript",
             )
 
-            # ── Transcript action row: Copy + Export ──────────────────────
-            with gr.Row(elem_classes="transcript-actions"):
-                copy_btn = gr.Button(
-                    "Copy text", size="sm", variant="secondary",
-                    scale=0, elem_id="copy-text",
-                )
-
-            # ── Export bar ────────────────────────────────────────────────
-            with gr.Row(elem_id="export-bar"):
-                export_fmt = gr.Dropdown(
-                    choices=list(_EXPORT_FNS.keys()),
-                    value="Plain text (.txt)",
-                    label="Format",
-                    container=False,
-                    scale=3,
-                    elem_id="export-fmt",
-                )
-                export_btn = gr.Button(
-                    "Export",
-                    size="sm",
-                    scale=1,
-                    elem_id="export-btn",
-                )
-                export_file = gr.File(
-                    label="",
-                    visible=False,
-                    elem_id="export-file",
-                    scale=2,
-                )
-
-            region_output = gr.Image(
-                label="Source region", height=110, interactive=False,
-                elem_id="region", buttons=["fullscreen"],
+    # ── Action block: every button that does something, plus the status line ──
+    with gr.Column(elem_classes="stage-card", elem_id="action-card"):
+        with gr.Row(elem_id="action-row"):
+            gr.HTML(
+                _card_heading("Action", "Run the scan, then pick a file type and export. "
+                                        "Word and PDF include the image; Text downloads as a zip with the image."),
+                elem_classes="stage-title", elem_id="action-title",
             )
+            run_btn = gr.Button("Recognize manuscript", variant="primary", size="md", scale=0,
+                                interactive=False, elem_id="recognize")
+            stop_btn = gr.Button("Stop", size="sm", min_width=60, scale=0, interactive=False, elem_id="stop-btn")
+            resume_btn = gr.Button("Resume", size="sm", min_width=60, scale=0, visible=False, elem_id="resume-btn")
+            reset_btn = gr.Button("Reset", size="sm", min_width=60, scale=0, interactive=False, elem_id="reset-btn")
+            copy_btn = gr.Button("Copy text", size="sm", variant="secondary", min_width=60, scale=0,
+                                 interactive=False, elem_id="copy-text")
+            export_fmt = gr.Radio(
+                choices=[(label, value) for label, value, _fn in EXPORT_TYPES],
+                value=None, show_label=False, container=False, scale=0, elem_id="export-type",
+            )
+            export_btn = gr.Button("Export", size="sm", min_width=60, scale=0, interactive=False, elem_id="export-btn")
+            export_file = gr.File(label="", visible=False, elem_id="export-file")
+        with gr.Row(elem_id="action-foot"):
+            status_output = gr.Markdown("Upload an image to begin", elem_classes="status-bar")
+            export_hint = gr.Markdown("Choose a file type to export", elem_id="export-hint")
 
     with gr.Accordion(
-        "Behind the scan \u00b7 lines & text regions",
+        "Behind the scan · lines & text regions",
         open=False, elem_id="details",
     ):
         plain_output  = gr.Textbox(label="Plain text", lines=4, buttons=["copy"], interactive=False)
@@ -1832,7 +1984,7 @@ with gr.Blocks(title="Palm Leaf OCR") as demo:
 
     gr.HTML(
         '<div class="app-foot">'
-        '<span>LeafOCR \u00b7 Manuscript recognition</span>'
+        '<span>LeafOCR · Manuscript recognition</span>'
         '<span>From fragile leaves to lasting words.</span>'
         '</div>'
     )
@@ -1840,39 +1992,63 @@ with gr.Blocks(title="Palm Leaf OCR") as demo:
     # ── Output list (must match OUT_KEYS order) ────────────────────────────
     all_outputs = [
         mask_output, annotated_output, line_output, chunk_output, output_text,
-        plain_output, status_output, region_output, session_state, stop_btn, resume_btn,
+        plain_output, status_output, region_output, session_state,
+        run_btn, stop_btn, resume_btn, reset_btn, copy_btn, export_btn, export_hint,
         skeleton_output,
     ]
 
-    # ── Pipeline events (unchanged) ────────────────────────────────────────
-    run_evt    = run_btn.click(fn=run_pipeline,    inputs=[input_image, session_state], outputs=all_outputs)
-    resume_evt = resume_btn.click(fn=resume_pipeline, inputs=[input_image, session_state], outputs=all_outputs)
-    running    = [run_evt, resume_evt]
+    def _refresh_export(event):
+        """After `event` ends, recheck whether Export can be pressed."""
+        event.then(fn=export_state, inputs=[export_fmt, session_state], outputs=[export_btn, export_hint],
+                   concurrency_limit=None)
 
-    stop_btn.click(fn=stop_pipeline, inputs=[session_state], outputs=all_outputs,
-                   cancels=running, concurrency_limit=None)
-    reset_btn.click(fn=reset_session, inputs=[session_state], outputs=all_outputs,
-                    cancels=running, concurrency_limit=None)
-    input_image.upload(fn=reset_session, inputs=[session_state], outputs=all_outputs,
-                       cancels=running, concurrency_limit=None)
-    input_image.clear(fn=reset_session, inputs=[session_state], outputs=all_outputs,
-                      cancels=running, concurrency_limit=None)
+    # ── Scan events ────────────────────────────────────────────────────────
+    run_inputs = [input_image, session_state, source_name]
+    # "multiple": a click right after Reset waits for the replaced scan to end instead
+    # of being dropped. The buttons are off during a scan, so clicks cannot pile up.
+    _refresh_export(run_btn.click(fn=run_pipeline, inputs=run_inputs, outputs=all_outputs,
+                                  trigger_mode="multiple"))
+    _refresh_export(resume_btn.click(fn=resume_pipeline, inputs=run_inputs, outputs=all_outputs,
+                                     trigger_mode="multiple"))
+    stop_btn.click(fn=stop_pipeline, inputs=[session_state], outputs=all_outputs, concurrency_limit=None)
+    _refresh_export(reset_btn.click(fn=reset_session, inputs=[session_state],
+                                    outputs=[*all_outputs, input_image], concurrency_limit=None))
+    # Covers upload, paste and removing the image.
+    _refresh_export(input_image.change(fn=on_image_change, inputs=[input_image, session_state],
+                                       outputs=all_outputs, concurrency_limit=None))
+    input_image.change(fn=None, inputs=[input_image], outputs=[source_name],
+                       js="(file) => (file && file.orig_name) || ''")
 
+    # ── Finding text on the image ──────────────────────────────────────────
     output_text.select(fn=select_from_transcript, inputs=[session_state], outputs=all_outputs,
                        concurrency_limit=None)
     chunk_output.select(fn=select_from_gallery, inputs=[session_state], outputs=all_outputs,
                         concurrency_limit=None)
     copy_btn.click(fn=None, inputs=[plain_output],
-                   js="(t) => { navigator.clipboard.writeText(t || ''); }")
+                   js="""(t) => {
+                       const btn = document.querySelector('#copy-text');
+                       const show = (msg, ok) => {
+                           btn.style.setProperty('min-width', btn.offsetWidth + 'px', 'important');  // the button keeps its size
+                           btn.dataset.msg = msg;
+                           btn.classList.add('copy-note');
+                           btn.classList.toggle('copied', ok);
+                           clearTimeout(window.copyNoteTimer);
+                           window.copyNoteTimer = setTimeout(() => {
+                               btn.classList.remove('copy-note', 'copied');
+                               btn.style.removeProperty('min-width');
+                           }, 1800);
+                       };
+                       navigator.clipboard.writeText(t || '').then(
+                           () => show('Copied', true),
+                           () => show('Copy failed', false),
+                       );
+                   }""")
 
-    # ── Export event ───────────────────────────────────────────────────────
-    def _do_export_ui(fmt, session):
-        path = do_export(fmt, session)
-        return path
-
-    # Build the file on the server, then have the browser download it right away.
+    # ── Export: build the file on the server, then start the download right away ──
+    export_fmt.change(fn=export_state, inputs=[export_fmt, session_state], outputs=[export_btn, export_hint],
+                      concurrency_limit=None)
     export_btn.click(
-        fn=_do_export_ui,
+        fn=do_export,
         inputs=[export_fmt, session_state],
         outputs=[export_file],
         concurrency_limit=None,
@@ -1890,12 +2066,9 @@ with gr.Blocks(title="Palm Leaf OCR") as demo:
         }""",
     )
 
-    # ── Scanner toggle ─────────────────────────────────────────────────────
-    toggle_btn.click(
-        fn=_toggle_scanner,
-        inputs=[scanner_visible],
-        outputs=[scanner_visible, scanner_col, toggle_btn],
-    )
+    # ── Live scanner: Hide and Show ────────────────────────────────────────
+    hide_scanner_btn.click(fn=_hide_scanner, outputs=[scanner_col, scanner_toolbar])
+    show_scanner_btn.click(fn=_show_scanner, outputs=[scanner_col, scanner_toolbar])
 
 
 if __name__ == "__main__":
